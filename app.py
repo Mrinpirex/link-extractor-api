@@ -11,11 +11,6 @@ from bs4 import BeautifulSoup
 app = Flask(__name__)
 
 API_KEY = os.environ.get("API_KEY", "")
-ALLOWED_HOSTS = {
-    host.strip().lower()
-    for host in os.environ.get("ALLOWED_HOSTS", "").split(",")
-    if host.strip()
-}
 
 TIMEOUT = 15
 MAX_BYTES = 2_000_000
@@ -41,26 +36,22 @@ def validate_url(url):
 
         host = parsed.hostname.rstrip(".").lower()
 
-        if not ALLOWED_HOSTS or not any(
-            host == allowed or host.endswith("." + allowed)
-            for allowed in ALLOWED_HOSTS
-        ):
-            raise ValueError("Hostname is not in ALLOWED_HOSTS.")
-
         try:
             addresses = [ipaddress.ip_address(host)]
         except ValueError:
-            addresses = [
+            addresses = list({
                 ipaddress.ip_address(item[4][0])
                 for item in socket.getaddrinfo(
                     host,
                     parsed.port or (443 if parsed.scheme == "https" else 80),
                     type=socket.SOCK_STREAM,
                 )
-            ]
+            })
 
         if not addresses or any(not ip.is_global for ip in addresses):
-            raise ValueError("Non-public network destinations are not allowed.")
+            raise ValueError(
+                "Private or non-public network destinations are not allowed."
+            )
 
         return parsed
 
@@ -90,7 +81,7 @@ def fetch_page(start_url):
             response.close()
 
             if not location:
-                raise ValueError("Redirect did not provide a destination.")
+                raise ValueError("Redirect has no destination.")
 
             current_url = urljoin(current_url, location)
             continue
@@ -99,10 +90,12 @@ def fetch_page(start_url):
 
         content_type = response.headers.get("Content-Type", "").lower()
 
-        if "text/html" not in content_type and \
-                "application/xhtml+xml" not in content_type:
+        if (
+            "text/html" not in content_type
+            and "application/xhtml+xml" not in content_type
+        ):
             response.close()
-            raise ValueError("URL did not return an HTML page.")
+            raise ValueError("The URL did not return an HTML page.")
 
         chunks = []
         total = 0
@@ -163,38 +156,6 @@ def extract_page_links(source_url):
     }
 
 
-@app.get("/")
-def health():
-    return jsonify({
-        "success": True,
-        "service": "authorized-link-extractor",
-        "status": "ok",
-    })
-
-
-@app.get("/api/links")
-def api_links():
-    if not check_api_key(request.headers.get("X-API-Key", "")):
-        return jsonify({
-            "success": False,
-            "error": "Unauthorized. Supply a valid X-API-Key header.",
-        }), 401
-
-    return handle_extraction()
-
-
-@app.get("/url")
-def direct_url():
-    # Allows direct browser access using ?url=...&key=...
-    if not check_api_key(request.args.get("key", "")):
-        return jsonify({
-            "success": False,
-            "error": "Unauthorized. Add your API key using the key parameter.",
-        }), 401
-
-    return handle_extraction()
-
-
 def handle_extraction():
     source_url = request.args.get("url", "").strip()
 
@@ -233,7 +194,37 @@ def handle_extraction():
         }), 500
 
 
+@app.get("/")
+def health():
+    return jsonify({
+        "success": True,
+        "service": "authorized-link-extractor",
+        "status": "ok",
+    })
+
+
+@app.get("/api/links")
+def api_links():
+    if not check_api_key(request.headers.get("X-API-Key", "")):
+        return jsonify({
+            "success": False,
+            "error": "Unauthorized. Supply a valid X-API-Key header.",
+        }), 401
+
+    return handle_extraction()
+
+
+@app.get("/url")
+def direct_url():
+    if not check_api_key(request.args.get("key", "")):
+        return jsonify({
+            "success": False,
+            "error": "Unauthorized. Add your API key using key=...",
+        }), 401
+
+    return handle_extraction()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
-
