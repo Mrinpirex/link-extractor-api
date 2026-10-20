@@ -1,228 +1,154 @@
+
 import os
-import hmac
 import ipaddress
 import socket
 from urllib.parse import urlparse, urljoin
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
 API_KEY = os.environ.get("API_KEY", "")
-
 TIMEOUT = 15
-MAX_BYTES = 2_000_000
-MAX_REDIRECTS = 4
-USER_AGENT = "AuthorizedLinkExtractor/1.0"
+MAX_BYTES = 2 * 1024 * 1024
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; LinkExtractor/1.0)"
+}
 
 
-def check_api_key(supplied_key):
-    return bool(API_KEY) and hmac.compare_digest(
-        supplied_key or "", API_KEY
-    )
-
-
-def validate_url(url):
+def valid_public_url(url):
     try:
         parsed = urlparse(url)
 
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            raise ValueError("Only HTTP and HTTPS URLs are allowed.")
+        if parsed.scheme not in ("http", "https"):
+            return False
 
-        if parsed.username or parsed.password:
-            raise ValueError("URLs containing credentials are not allowed.")
+        if not parsed.hostname or parsed.username or parsed.password:
+            return False
 
-        host = parsed.hostname.rstrip(".").lower()
-
-        try:
-            addresses = [ipaddress.ip_address(host)]
-        except ValueError:
-            addresses = list({
-                ipaddress.ip_address(item[4][0])
-                for item in socket.getaddrinfo(
-                    host,
-                    parsed.port or (443 if parsed.scheme == "https" else 80),
-                    type=socket.SOCK_STREAM,
-                )
-            })
-
-        if not addresses or any(not ip.is_global for ip in addresses):
-            raise ValueError(
-                "Private or non-public network destinations are not allowed."
-            )
-
-        return parsed
-
-    except (socket.gaierror, OSError) as exc:
-        raise ValueError("Hostname could not be resolved.") from exc
-
-
-def fetch_page(start_url):
-    current_url = start_url
-
-    for _ in range(MAX_REDIRECTS + 1):
-        validate_url(current_url)
-
-        response = requests.get(
-            current_url,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "text/html",
-            },
-            timeout=TIMEOUT,
-            allow_redirects=False,
-            stream=True,
+        # Reject local and private network addresses.
+        addresses = socket.getaddrinfo(
+            parsed.hostname, None, type=socket.SOCK_STREAM
         )
 
-        if response.status_code in (301, 302, 303, 307, 308):
+        for item in addresses:
+            ip = ipaddress.ip_address(item[4][0])
+            if not ip.is_global:
+                return False
+
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def extract_links(url):
+    if not valid_public_url(url):
+        raise ValueError("URL must use a public HTTP or HTTPS address.")
+
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=TIMEOUT,
+        allow_redirects=False,
+        stream=True,
+    )
+
+    try:
+        if response.is_redirect:
             location = response.headers.get("Location")
-            response.close()
-
-            if not location:
-                raise ValueError("Redirect has no destination.")
-
-            current_url = urljoin(current_url, location)
-            continue
+            if location:
+                return {
+                    "source": url,
+                    "redirect": urljoin(url, location),
+                    "links": [],
+                }
 
         response.raise_for_status()
 
-        content_type = response.headers.get("Content-Type", "").lower()
-
-        if (
-            "text/html" not in content_type
-            and "application/xhtml+xml" not in content_type
-        ):
-            response.close()
-            raise ValueError("The URL did not return an HTML page.")
+        content_type = response.headers.get("Content-Type", "")
+        if "html" not in content_type.lower():
+            return {
+                "source": url,
+                "content_type": content_type,
+                "links": [],
+                "message": "The URL did not return an HTML page.",
+            }
 
         chunks = []
         total = 0
 
-        try:
-            for chunk in response.iter_content(chunk_size=16384):
-                if not chunk:
-                    continue
+        for chunk in response.iter_content(chunk_size=16384):
+            total += len(chunk)
+            if total > MAX_BYTES:
+                raise ValueError("Page exceeds the 2 MB size limit.")
+            chunks.append(chunk)
 
-                total += len(chunk)
+        html = b"".join(chunks)
+    finally:
+        response.close()
 
-                if total > MAX_BYTES:
-                    raise ValueError("HTML response exceeds the 2 MB limit.")
-
-                chunks.append(chunk)
-
-            final_url = response.url
-
-        finally:
-            response.close()
-
-        return b"".join(chunks), final_url
-
-    raise ValueError("Too many redirects.")
-
-
-def extract_page_links(source_url):
-    page_bytes, final_url = fetch_page(source_url)
-    soup = BeautifulSoup(page_bytes, "html.parser")
-
+    soup = BeautifulSoup(html, "html.parser")
     links = []
     seen = set()
 
-    for anchor in soup.find_all("a", href=True):
-        href = anchor.get("href", "").strip()
-        absolute_url = urljoin(final_url, href)
-        parsed = urlparse(absolute_url)
+    for tag in soup.find_all("a", href=True):
+        href = urljoin(url, tag["href"].strip())
 
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        if not href.startswith(("http://", "https://")):
             continue
 
-        if absolute_url in seen:
-            continue
-
-        seen.add(absolute_url)
-
-        links.append({
-            "text": anchor.get_text(" ", strip=True)[:200],
-            "url": absolute_url,
-        })
+        if href not in seen:
+            seen.add(href)
+            links.append({
+                "text": tag.get_text(" ", strip=True),
+                "url": href,
+            })
 
     return {
-        "success": True,
-        "source_url": source_url,
-        "final_url": final_url,
+        "source": url,
         "count": len(links),
         "links": links,
     }
 
 
-def handle_extraction():
-    source_url = request.args.get("url", "").strip()
-
-    if not source_url:
-        return jsonify({
-            "success": False,
-            "error": "Missing required url parameter.",
-        }), 400
-
-    try:
-        return jsonify(extract_page_links(source_url))
-
-    except ValueError as exc:
-        return jsonify({
-            "success": False,
-            "error": str(exc),
-        }), 400
-
-    except requests.Timeout:
-        return jsonify({
-            "success": False,
-            "error": "Source webpage timed out.",
-        }), 504
-
-    except requests.RequestException:
-        return jsonify({
-            "success": False,
-            "error": "Could not fetch source webpage.",
-        }), 502
-
-    except Exception:
-        app.logger.exception("Unexpected extraction error")
-        return jsonify({
-            "success": False,
-            "error": "Internal server error.",
-        }), 500
-
-
 @app.get("/")
-def health():
+def home():
     return jsonify({
-        "success": True,
-        "service": "authorized-link-extractor",
+        "service": "link-extractor",
         "status": "ok",
+        "usage": "/api/links?url=https://example.com"
     })
 
 
 @app.get("/api/links")
 def api_links():
-    if not check_api_key(request.headers.get("X-API-Key", "")):
+    supplied_key = request.headers.get("X-API-Key", "")
+
+    if not API_KEY or supplied_key != API_KEY:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    url = request.args.get("url", "").strip()
+    if not url:
         return jsonify({
             "success": False,
-            "error": "Unauthorized. Supply a valid X-API-Key header.",
-        }), 401
+            "error": "Missing required query parameter: url"
+        }), 400
 
-    return handle_extraction()
-
-
-@app.get("/url")
-def direct_url():
-    if not check_api_key(request.args.get("key", "")):
+    try:
+        result = extract_links(url)
+        result["success"] = True
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except requests.RequestException as exc:
         return jsonify({
             "success": False,
-            "error": "Unauthorized. Add your API key using key=...",
-        }), 401
-
-    return handle_extraction()
+            "error": "Could not fetch the requested page.",
+            "details": str(exc),
+        }), 502
 
 
 if __name__ == "__main__":
